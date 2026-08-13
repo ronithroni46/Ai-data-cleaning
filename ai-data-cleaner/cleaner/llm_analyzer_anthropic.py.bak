@@ -1,0 +1,84 @@
+"""
+llm_analyzer.py
+Sends a data profile to Claude and gets back structured cleaning suggestions.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+
+import anthropic
+
+MODEL = "claude-sonnet-5"
+
+SYSTEM_PROMPT = """You are a meticulous data cleaning assistant.
+You will be given a JSON profile of a tabular dataset (column stats, missing
+values, outliers, sample rows) -- not the full dataset.
+
+Identify concrete data quality issues and propose a specific, safe fix for
+each one. Only flag real issues you can see evidence for in the profile.
+
+Respond with ONLY a JSON array (no prose, no markdown fences). Each item:
+{
+  "column": "<column name, or '__row__' for whole-row issues like duplicates>",
+  "issue": "<short human-readable description of the problem>",
+  "severity": "low" | "medium" | "high",
+  "suggested_fix": "<short human-readable description of the fix>",
+  "fix_action": {
+    "type": "drop_duplicates" | "fill_missing" | "strip_whitespace"
+            | "standardize_case" | "convert_dtype" | "clip_outliers"
+            | "drop_column" | "rename_values" | "custom",
+    "params": { }
+  }
+}
+
+fix_action.params conventions by type:
+- fill_missing: {"strategy": "mean"|"median"|"mode"|"constant", "value": <optional, for constant>}
+- strip_whitespace: {}
+- standardize_case: {"case": "lower"|"upper"|"title"}
+- convert_dtype: {"to": "int"|"float"|"datetime"|"string"}
+- clip_outliers: {"lower": <number>, "upper": <number>}
+- drop_column: {}
+- rename_values: {"mapping": {"old_value": "new_value"}}
+- drop_duplicates: {}
+- custom: {"description": "<what to do, since no structured action fits>"}
+
+If there are no real issues, return [].
+"""
+
+
+def analyze(profile_json_text: str, api_key: str | None = None) -> list[dict]:
+    """Call Claude with the profile and return a list of issue dicts."""
+    client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=4000,
+        system=SYSTEM_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Here is the dataset profile:\n\n{profile_json_text}",
+            }
+        ],
+    )
+
+    text_parts = [block.text for block in response.content if block.type == "text"]
+    raw_text = "\n".join(text_parts).strip()
+
+    # Be defensive: strip markdown fences if the model adds them anyway
+    raw_text = re.sub(r"^```(json)?", "", raw_text.strip())
+    raw_text = re.sub(r"```$", "", raw_text.strip())
+
+    try:
+        issues = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Could not parse LLM response as JSON: {e}\nRaw response:\n{raw_text}"
+        ) from e
+
+    if not isinstance(issues, list):
+        raise ValueError("Expected a JSON array of issues from the LLM.")
+
+    return issues
